@@ -1,4 +1,3 @@
-
 package org.firstinspires.ftc.teamcode.Teleop;
 
 import com.acmerobotics.dashboard.config.Config;
@@ -21,27 +20,40 @@ public class Showcase extends LinearOpMode {
     private CRServo Arm;
 
     double lbPower, lfPower, rbPower, rfPower;
-    double slPower, srPower, ilPower, irPower;
+    double ilPower, irPower;
 
-    // Arm variables
-    public static double ARM_POS_1 = 0.482;
-    public static double ARM_POS_2 = 0.4928;
-    public static double ARM_POS_3 = 0.5036;
-    public static double armTarget = 0.0;
+    // Shooter RPM & encoder conversion (update to match shooter motor/gearing)
+    public static double DEFAULT_SHOOTER_RPM = 1760.0;
+    public static double UNJAM_SHOOTER_RPM = -1200.0;
+    public static double TICKS_PER_MOTOR_REV = 28.0; // e.g., goBILDA 5202/5203/5204 yellow jacket base
+    public static double SHOOTER_GEAR_RATIO = 1.0;   // motor revs per 1 shooter wheel rev
+    public static double REV_BEFORE_GATE_SECONDS = 0.35;
+    public static double AUTO_SEQUENCE_REV_SECONDS = 2.5;
+
+    // Intake & feed powers
+    public static double INTAKE_TOGGLE_POWER = 1.0;
+    public static double FEED_INTAKE_POWER = 0.55; // medium power/RPM while feeding
+    public static double UNJAM_INTAKE_POWER = -0.8;
+
+    // Arm variables (flower arm toggle)
+    public static double DEGREES_PER_SECOND = 90.0;
+    public static double ARM_POWER = 0.6;
+    public static double ARM_DOWN_ANGLE = 90.0;
+    public static double ARM_UP_ANGLE = 0.0;
 
     private ElapsedTime armTimer = new ElapsedTime();
     private boolean isArmMoving = false;
+    private boolean isArmDown = false;
     private double armTargetTime = 0.0;
-
-    public static double DEGREES_PER_SECOND = 90.0;
-    public static double ARM_POWER = 0.6;
-
     private double currentEstimatedAngle = 0.0;
     private double targetAngle = 0.0;
 
-    // Gate servo positions
+    // Gate servo positions (lift gate by X degrees to clear into shooting chamber)
     public static double GATE_HOME_POSITION = 0.0;
-    public static double GATE_CLOCKWISE_POSITION = 0.5;
+    public static double GATE_LIFT_DEGREES = 45.0;
+    public static double SERVO_MAX_DEGREES = 270.0;
+    public static double GATE_OPEN_POSITION =
+            Math.min(1.0, GATE_HOME_POSITION + (GATE_LIFT_DEGREES / SERVO_MAX_DEGREES));
 
     // Shooter PID coefficients
     public static double shooterP = 0.001;
@@ -49,7 +61,20 @@ public class Showcase extends LinearOpMode {
     public static double shooterD = 0.0;
     public static double shooterF = 0.0;
 
-    private double targetShooterVelocity = 0.0;
+    // Toggle & timer states
+    private boolean intakeToggledOn = false;
+    private boolean prevRbTogglePressed = false;
+    private boolean prevLbTogglePressed = false;
+
+    private boolean isFeedingHold = false;
+    private boolean isAutoSequenceActive = false;
+    private boolean gateIsOpen = false;
+
+    private ElapsedTime revDelayTimer = new ElapsedTime();
+    private boolean revDelayStarted = false;
+    private ElapsedTime autoSequenceTimer = new ElapsedTime();
+
+    private double targetShooterRpm = DEFAULT_SHOOTER_RPM;
 
     @Override
     public void runOpMode() {
@@ -71,11 +96,11 @@ public class Showcase extends LinearOpMode {
         Shooterr = hardwareMap.get(DcMotorEx.class, "Shooterr");
         Shooterl = hardwareMap.get(DcMotorEx.class, "Shooterl");
 
-        // Motor directions
+        // Drive motor directions (left reversed, right forward for mirrored mounting)
         LB.setDirection(DcMotor.Direction.REVERSE);
         LF.setDirection(DcMotor.Direction.REVERSE);
-        RB.setDirection(DcMotor.Direction.REVERSE);
-        RF.setDirection(DcMotor.Direction.REVERSE);
+        RB.setDirection(DcMotor.Direction.FORWARD);
+        RF.setDirection(DcMotor.Direction.FORWARD);
 
         Intakel.setDirection(DcMotor.Direction.FORWARD);
         Intaker.setDirection(DcMotor.Direction.REVERSE);
@@ -110,7 +135,6 @@ public class Showcase extends LinearOpMode {
         Shooterl.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         Shooterr.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
 
-        // Set Gate to original position
         Gate.setPosition(GATE_HOME_POSITION);
 
         telemetry.addData("Status", "Initialized");
@@ -119,7 +143,6 @@ public class Showcase extends LinearOpMode {
         waitForStart();
         runtime.reset();
 
-        // Initialize shooter PID
         BasicPIDController shooterPID =
                 new BasicPIDController(shooterP, shooterI, shooterD);
 
@@ -127,152 +150,210 @@ public class Showcase extends LinearOpMode {
 
             shooterPID.setPID(shooterP, shooterI, shooterD);
 
-            intakeMethod();
+            updateDrive();
+            updateArmToggle();
+            updateMechanismActions();
             shooterMethod(shooterPID);
-            armControlMethod();
-            gateControlMethod();
-
-            // Mecanum drive
-            double forward = -gamepad1.left_stick_y;
-            double strafe = -gamepad1.left_stick_x;
-            double turn = gamepad1.right_stick_x;
-
-            lbPower = forward - strafe + turn;
-            lfPower = forward + strafe + turn;
-            rbPower = forward + strafe - turn;
-            rfPower = forward - strafe - turn;
-
-            double max = Math.max(
-                    Math.max(Math.abs(lfPower), Math.abs(rfPower)),
-                    Math.max(Math.abs(lbPower), Math.abs(rbPower))
-            );
-
-            if (max > 1.0) {
-                lbPower /= max;
-                lfPower /= max;
-                rbPower /= max;
-                rfPower /= max;
-            }
-
-            LB.setPower(lbPower);
-            LF.setPower(lfPower);
-            RB.setPower(rbPower);
-            RF.setPower(rfPower);
+            applyHardwareOutputs();
 
             // Telemetry
             telemetry.addData("Run Time", runtime);
-            telemetry.addData("Shooter Target Vel", targetShooterVelocity);
-            telemetry.addData("Shooter Left Vel", Shooterl.getVelocity());
-            telemetry.addData("Shooter Right Vel", Shooterr.getVelocity());
-            telemetry.addData("Arm Est. Angle", currentEstimatedAngle);
-            telemetry.addData("Arm Moving", isArmMoving);
-            telemetry.addData("Gate Position", gamepad1.right_trigger > 0.1
-                    ? GATE_CLOCKWISE_POSITION : GATE_HOME_POSITION);
+            telemetry.addData("Intake Toggled", intakeToggledOn);
+            telemetry.addData("Arm Down", isArmDown);
+            telemetry.addData("Shooter Target RPM", targetShooterRpm);
+            telemetry.addData("Shooter Left TPS", Shooterl.getVelocity());
+            telemetry.addData("Shooter Right TPS", Shooterr.getVelocity());
+            telemetry.addData("Gate Open", gateIsOpen);
+            telemetry.addData("Auto Seq Active", isAutoSequenceActive);
             telemetry.update();
         }
     }
 
-    // CR Servo arm control
-    private void armControlMethod() {
+    // Intake is front, shooter is back: Left stick = move, Right stick = rotate
+    private void updateDrive() {
+        double forward = -gamepad1.left_stick_y;
+        double strafe = gamepad1.left_stick_x;
+        double turn = gamepad1.right_stick_x;
 
-        if (isArmMoving) {
+        lbPower = forward - strafe + turn;
+        lfPower = forward + strafe + turn;
+        rbPower = forward + strafe - turn;
+        rfPower = forward - strafe - turn;
 
-            if (armTimer.seconds() >= armTargetTime) {
-                Arm.setPower(0.0);
-                currentEstimatedAngle = targetAngle;
-                isArmMoving = false;
-            }
+        double max = Math.max(
+                Math.max(Math.abs(lfPower), Math.abs(rfPower)),
+                Math.max(Math.abs(lbPower), Math.abs(rbPower))
+        );
 
-        } else {
+        if (max > 1.0) {
+            lbPower /= max;
+            lfPower /= max;
+            rbPower /= max;
+            rfPower /= max;
+        }
+    }
 
-            double requestedAngle = -1;
+    // LB toggles flower arm down / up on button press
+    private void updateArmToggle() {
+        boolean lbPressed = gamepad1.left_bumper;
 
-            if (gamepad1.y) {
-                requestedAngle = 90.0;
-            } else if (gamepad1.x) {
-                requestedAngle = 45.0;
-            } else if (gamepad1.a) {
-                requestedAngle = 0.0;
-            }
+        if (lbPressed && !prevLbTogglePressed) {
+            isArmDown = !isArmDown;
+            double requestedAngle = isArmDown ? ARM_DOWN_ANGLE : ARM_UP_ANGLE;
 
-            if (requestedAngle != -1 &&
-                    requestedAngle != currentEstimatedAngle) {
-
+            if (requestedAngle != currentEstimatedAngle) {
                 targetAngle = requestedAngle;
-
-                double angleDifference =
-                        targetAngle - currentEstimatedAngle;
-
+                double angleDifference = targetAngle - currentEstimatedAngle;
                 double direction = Math.signum(angleDifference);
 
                 Arm.setPower(ARM_POWER * direction);
-
-                armTargetTime =
-                        Math.abs(angleDifference) / DEGREES_PER_SECOND;
-
+                armTargetTime = Math.abs(angleDifference) / DEGREES_PER_SECOND;
                 armTimer.reset();
                 isArmMoving = true;
-
-            } else {
-                Arm.setPower(0.0);
             }
         }
-    }
+        prevLbTogglePressed = lbPressed;
 
-    // Standard servo Gate control
-    private void gateControlMethod() {
-
-        if (gamepad1.right_trigger > 0.1) {
-            Gate.setPosition(GATE_CLOCKWISE_POSITION);
-        } else {
-            Gate.setPosition(GATE_HOME_POSITION);
+        if (isArmMoving && armTimer.seconds() >= armTargetTime) {
+            Arm.setPower(0.0);
+            currentEstimatedAngle = targetAngle;
+            isArmMoving = false;
         }
     }
 
-    // Shooter control
+    // Handles RB toggle/feed, LB rev hold, B unjam hold, A align+aim, X full sequence
+    private void updateMechanismActions() {
+        boolean rbDown = gamepad1.right_bumper;
+        boolean lbDown = gamepad1.left_bumper;
+        boolean bDown = gamepad1.b;
+
+        // Toggle intake on/off when RB is tapped
+        if (rbDown && !prevRbTogglePressed) {
+            intakeToggledOn = !intakeToggledOn;
+        }
+        prevRbTogglePressed = rbDown;
+
+        // Start full auto sequence on X press
+        if (gamepad1.x && !isAutoSequenceActive) {
+            isAutoSequenceActive = true;
+            autoSequenceTimer.reset();
+            revDelayStarted = false;
+        } else if (!gamepad1.x) {
+            isAutoSequenceActive = false;
+        }
+
+        // Default baseline each loop
+        targetShooterRpm = DEFAULT_SHOOTER_RPM;
+        ilPower = intakeToggledOn ? INTAKE_TOGGLE_POWER : 0.0;
+        irPower = intakeToggledOn ? INTAKE_TOGGLE_POWER : 0.0;
+        gateIsOpen = false;
+        isFeedingHold = false;
+
+        // 1. Highest priority: B (while held) -> Unjam (reverse intake & shooter)
+        if (bDown) {
+            isAutoSequenceActive = false;
+            revDelayStarted = false;
+            targetShooterRpm = UNJAM_SHOOTER_RPM;
+            ilPower = UNJAM_INTAKE_POWER;
+            irPower = UNJAM_INTAKE_POWER;
+            gateIsOpen = false;
+            return;
+        }
+
+        // 2. X: Auto align + auto aim RPM adjust + rev for 2.5s + feed (with delayed gate)
+        if (isAutoSequenceActive) {
+            autoAlignStep();
+            targetShooterRpm = getAutoAimTargetRpm();
+
+            if (!revDelayStarted) {
+                revDelayTimer.reset();
+                revDelayStarted = true;
+            }
+
+            if (autoSequenceTimer.seconds() >= AUTO_SEQUENCE_REV_SECONDS) {
+                // After 2.5s rev, feed into chamber
+                ilPower = FEED_INTAKE_POWER;
+                irPower = FEED_INTAKE_POWER;
+                gateIsOpen = (revDelayTimer.seconds() >= REV_BEFORE_GATE_SECONDS);
+            } else {
+                // Revving shooter before feeding; open gate after brief rev delay
+                gateIsOpen = (revDelayTimer.seconds() >= REV_BEFORE_GATE_SECONDS);
+            }
+            return;
+        }
+
+        // 3. A: Auto align + auto aim RPM adjust
+        if (gamepad1.a) {
+            autoAlignStep();
+            targetShooterRpm = getAutoAimTargetRpm();
+        }
+
+        // 4. LB (while held): Rev shooter (gate opens after brief rev delay)
+        if (lbDown) {
+            if (!revDelayStarted) {
+                revDelayTimer.reset();
+                revDelayStarted = true;
+            }
+            gateIsOpen = (revDelayTimer.seconds() >= REV_BEFORE_GATE_SECONDS);
+        }
+
+        // 5. RB (while held): Feed at medium power + lift gate (after brief rev delay)
+        if (rbDown) {
+            isFeedingHold = true;
+            if (!revDelayStarted) {
+                revDelayTimer.reset();
+                revDelayStarted = true;
+            }
+            ilPower = FEED_INTAKE_POWER;
+            irPower = FEED_INTAKE_POWER;
+            gateIsOpen = (revDelayTimer.seconds() >= REV_BEFORE_GATE_SECONDS);
+        }
+
+        // Reset rev delay timer once neither LB, RB, nor X is active
+        if (!lbDown && !rbDown && !isAutoSequenceActive) {
+            revDelayStarted = false;
+            gateIsOpen = false;
+        }
+    }
+
+    private void autoAlignStep() {
+        // Hook vision/odometry heading alignment adjustment here when ready
+    }
+
+    private double getAutoAimTargetRpm() {
+        // Hook distance-based RPM calculation here when ready; defaults to 1760 RPM
+        return DEFAULT_SHOOTER_RPM;
+    }
+
+    private double rpmToTicksPerSecond(double rpm) {
+        return (rpm / 60.0) * TICKS_PER_MOTOR_REV * SHOOTER_GEAR_RATIO;
+    }
+
+    // Shooter PID control
     private void shooterMethod(BasicPIDController pid) {
-
-        if (gamepad1.b) {
-            targetShooterVelocity = 2500.0;
-        } else if (gamepad1.left_trigger > 0.1) {
-            targetShooterVelocity = -2500.0;
-        }
-        else
-        {
-            targetShooterVelocity = 0.0;
-        }
-
+        double targetVelTps = rpmToTicksPerSecond(targetShooterRpm);
         double currentVelL = Shooterl.getVelocity();
         double currentVelR = Shooterr.getVelocity();
 
-        double powerL = pid.update(targetShooterVelocity, currentVelL)
-                + (targetShooterVelocity * shooterF);
-
-        double powerR = pid.update(targetShooterVelocity, currentVelR)
-                + (targetShooterVelocity * shooterF);
+        double powerL = pid.update(targetVelTps, currentVelL)
+                + (targetVelTps * shooterF);
+        double powerR = pid.update(targetVelTps, currentVelR)
+                + (targetVelTps * shooterF);
 
         Shooterl.setPower(powerL);
         Shooterr.setPower(powerR);
     }
 
-    // Intake control
-    private void intakeMethod() {
-
-        if (gamepad1.right_trigger > 0.1) {
-            irPower = 1.0;
-            ilPower = 1.0;
-        }
-        else if (gamepad1.b) {
-            irPower = -1.0;
-            ilPower = -1.0;
-        }
-        else {
-            irPower = 0.0;
-            ilPower = 0.0;
-        }
+    private void applyHardwareOutputs() {
+        LB.setPower(lbPower);
+        LF.setPower(lfPower);
+        RB.setPower(rbPower);
+        RF.setPower(rfPower);
 
         Intakel.setPower(ilPower);
         Intaker.setPower(irPower);
+
+        Gate.setPosition(gateIsOpen ? GATE_OPEN_POSITION : GATE_HOME_POSITION);
     }
 
     // Custom PID controller
@@ -296,7 +377,6 @@ public class Showcase extends LinearOpMode {
         }
 
         public double update(double reference, double state) {
-
             double error = reference - state;
 
             double dt = timer.seconds();
