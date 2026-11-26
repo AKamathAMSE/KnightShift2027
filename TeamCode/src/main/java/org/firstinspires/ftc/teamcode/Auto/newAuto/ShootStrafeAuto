@@ -1,0 +1,321 @@
+package org.firstinspires.ftc.teamcode.Auto.newAuto;
+
+import com.acmerobotics.dashboard.config.Config;
+import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
+import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.HardwareMap;
+import com.qualcomm.robotcore.hardware.Servo;
+import com.qualcomm.robotcore.hardware.VoltageSensor;
+import com.qualcomm.robotcore.util.ElapsedTime;
+
+
+// One place for the numbers Showcase (recording), PathReplayAuto and DriveCalTest all share.
+// Editable live from FTC Dashboard, but Dashboard values are lost on restart: copy keepers here.
+//
+// Drive, shoot, then strafe-forward-strafe.
+@Autonomous(name = "ShootStrafeAuto")
+@Config
+public class ShootStrafeAuto extends LinearOpMode {
+
+    public static double WHEEL_DIAMETER_MM = 76.0;
+
+    // UNVERIFIED. This is 28 encoder ticks per motor rev x 16 
+    // 16:1 is the true total reduction.
+    public static double TICKS_PER_WHEEL_REV = 448.0;
+
+    // Control Hub mounting: REV logo face up, USB ports toward the back of the robot.
+    public static RevHubOrientationOnRobot.LogoFacingDirection HUB_LOGO_DIRECTION =
+            RevHubOrientationOnRobot.LogoFacingDirection.UP;
+    public static RevHubOrientationOnRobot.UsbFacingDirection HUB_USB_DIRECTION =
+            RevHubOrientationOnRobot.UsbFacingDirection.BACKWARD;
+
+    // OpMode 
+    public static double FORWARD_INCHES = 20.0;   // how far to drive forward first
+    public static double DRIVE_POWER = 0.4;       // keep this low for a first test
+    public static double SEGMENT_TIMEOUT_S = 5.0; // abort a leg if it hasn't finished by then (stalled motor, bad encoder, etc.)
+
+    //  Moves AFTER shooting 
+    // * STRAFE_LEFT_1_INCHES: how far to strafe left right after shooting. 
+    // * FORWARD_2_INCHES: how far to drive forward after that first strafe. 
+    // * STRAFE_LEFT_2_INCHES: how far to strafe left at the very end. not needed for now
+    public static double STRAFE_LEFT_1_INCHES = 28.0;
+    public static double FORWARD_2_INCHES = 48.0;
+    // public static double STRAFE_LEFT_2_INCHES = 2.0;
+
+    // If the robot strafes LEFT when you wanted RIGHT, flip this to -1.0 and nothing else.
+    // * In this file EVERY strafe goes LEFT. If one goes RIGHT instead, flip this to -1.0.
+    public static double STRAFE_SIGN = 1.0;
+
+    // ---- Shooter + feed ----
+    // * SHOOTER_VELOCITY: shooter speed in encoder TICKS PER SECOND (not RPM). 1760 is the max speed we use. KnightShiftTeleop's B button uses 2300.
+    // * SHOOTER_REV_SECONDS: how long the shooter spins up BEFORE the gate opens.
+    // * FEED_SECONDS: how long the gate stays open and the intake runs (the shooter keeps spinning this whole time).
+    public static double SHOOTER_VELOCITY = 1760.0;
+    public static double SHOOTER_REV_SECONDS = 4.0;
+    public static double FEED_SECONDS = 4.0;
+
+    // * GATE_CLOCKWISE_POSITION: gate OPEN position (servo 0 to 1). Same value as KnightShiftTeleop. GATE_HOME_POSITION is closed.
+    public static double GATE_HOME_POSITION = 0.0;
+    public static double GATE_CLOCKWISE_POSITION = 0.5;
+
+    // * INTAKE_POWER: intake power while feeding (0 to 1). Same value as KnightShiftTeleop.
+    public static double INTAKE_POWER = 1.0;
+
+    // * Shooter PID coefficients. Same values as KnightShiftTeleop, change them there and here together.
+    public static double shooterP = 0.001;
+    public static double shooterI = 0.0;
+    public static double shooterD = 0.0;
+    public static double shooterF = 0.0;
+
+    public static double ticksToInches(double ticks) {
+        return ticks / TICKS_PER_WHEEL_REV * Math.PI * WHEEL_DIAMETER_MM / 25.4;
+    }
+
+    public static double inchesToTicks(double inches) {
+        return inches / (Math.PI * WHEEL_DIAMETER_MM / 25.4) * TICKS_PER_WHEEL_REV;
+    }
+
+    // Robot-frame motion from the four wheel encoders (readings already follow each motor's
+    // direction setting). Same signs as Showcase's mixing: lb = f - s + t, lf = f + s + t,
+    // rb = f + s - t, rf = f - s - t. Forward and sideways only; turning cancels out of both.
+    public static double forwardTicks(double lb, double lf, double rb, double rf) {
+        return (lb + lf + rb + rf) / 4.0;
+    }
+
+    public static double strafeTicks(double lb, double lf, double rb, double rf) {
+        return (-lb + lf + rb - rf) / 4.0;
+    }
+
+    // Lowest voltage among the hub's sensors, or 12 V if none report.
+    public static double batteryVoltage(HardwareMap hw) {
+        double min = Double.POSITIVE_INFINITY;
+        for (VoltageSensor vs : hw.voltageSensor) {
+            double v = vs.getVoltage();
+            if (v > 0 && v < min) min = v;
+        }
+        return min == Double.POSITIVE_INFINITY ? 12.0 : min;
+    }
+
+    // ---- Hardware ----
+    private DcMotorEx lb, lf, rb, rf;
+    private DcMotorEx shooterl, shooterr;
+    private DcMotorEx intakel, intaker;
+    private Servo gate;
+
+    @Override
+    public void runOpMode() {
+
+        // Names must match the Robot Configuration exactly (same names Showcase uses).
+        lb = hardwareMap.get(DcMotorEx.class, "LB");
+        lf = hardwareMap.get(DcMotorEx.class, "LF");
+        rb = hardwareMap.get(DcMotorEx.class, "RB");
+        rf = hardwareMap.get(DcMotorEx.class, "RF");
+
+        shooterl = hardwareMap.get(DcMotorEx.class, "Shooterl");
+        shooterr = hardwareMap.get(DcMotorEx.class, "Shooterr");
+
+        intakel = hardwareMap.get(DcMotorEx.class, "Intakel");
+        intaker = hardwareMap.get(DcMotorEx.class, "Intaker");
+
+        gate = hardwareMap.get(Servo.class, "Gate");
+
+        // Same directions KnightShiftTeleop uses, so "forward" here means the same thing it does in TeleOp.
+        lb.setDirection(DcMotor.Direction.REVERSE);
+        lf.setDirection(DcMotor.Direction.FORWARD);
+        rb.setDirection(DcMotor.Direction.REVERSE);
+        rf.setDirection(DcMotor.Direction.FORWARD);
+
+        shooterl.setDirection(DcMotor.Direction.REVERSE);
+        shooterr.setDirection(DcMotor.Direction.FORWARD);
+
+        intakel.setDirection(DcMotor.Direction.FORWARD);
+        intaker.setDirection(DcMotor.Direction.REVERSE);
+
+        gate.setDirection(Servo.Direction.FORWARD);
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+            m.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+            m.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        }
+
+        // Shooter and intake use the same modes as KnightShiftTeleop.
+        for (DcMotorEx m : new DcMotorEx[]{shooterl, shooterr, intakel, intaker}) {
+            m.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+            m.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        }
+
+        // Gate starts closed.
+        gate.setPosition(GATE_HOME_POSITION);
+
+        telemetry.addLine("ShootStrafeAuto ready: forward " + FORWARD_INCHES + " in, shoot, then strafe left / forward / strafe left");
+        telemetry.addData("Battery Voltage", "%.2f V", batteryVoltage(hardwareMap));
+        telemetry.update();
+
+        waitForStart();
+        if (isStopRequested()) return;
+
+        // Leg 1: straight forward. f only (s = 0, t = 0): every wheel gets the same ticks.
+        double fwdTicks = inchesToTicks(FORWARD_INCHES);
+        driveSegment(fwdTicks, fwdTicks, fwdTicks, fwdTicks, DRIVE_POWER, "forward");
+
+        // Rev shooter, open gate, run intake.
+        shootAndFeed();
+
+        // Strafe left, forward, strafe left.
+        strafeLeft(STRAFE_LEFT_1_INCHES, "strafe left 1");
+
+        double fwd2Ticks = inchesToTicks(FORWARD_2_INCHES);
+        driveSegment(fwd2Ticks, fwd2Ticks, fwd2Ticks, fwd2Ticks, DRIVE_POWER, "forward 2");
+
+        // strafeLeft(STRAFE_LEFT_2_INCHES, "strafe left 2");
+
+        telemetry.addLine("Done.");
+        telemetry.update();
+    }
+
+    // Strafe pattern: strafing right is s only (f = 0, t = 0): lb = -s, lf = +s, rb = +s, rf = -s.
+    // Strafing left is the exact opposite of that.
+    private void strafeLeft(double inches, String label) {
+        double t = inchesToTicks(inches) * STRAFE_SIGN;
+        driveSegment(t, -t, -t, t, DRIVE_POWER, label);
+    }
+
+    // Same shooter method as KnightShiftTeleop (PID on velocity), but runs by time instead of a button.
+    // Phase 1: shooter revs alone. Phase 2: gate opens, intake runs, shooter keeps spinning.
+    private void shootAndFeed() {
+
+        BasicPIDController pidL = new BasicPIDController(shooterP, shooterI, shooterD);
+        BasicPIDController pidR = new BasicPIDController(shooterP, shooterI, shooterD);
+
+        ElapsedTime timer = new ElapsedTime();
+
+        // Phase 1: rev
+        while (opModeIsActive() && timer.seconds() < SHOOTER_REV_SECONDS) {
+            runShooter(pidL, pidR, SHOOTER_VELOCITY);
+
+            telemetry.addData("Phase", "revving shooter");
+            telemetry.addData("Time left (s)", "%.1f", SHOOTER_REV_SECONDS - timer.seconds());
+            telemetry.addData("Shooter L/R vel", "%.0f / %.0f", shooterl.getVelocity(), shooterr.getVelocity());
+            telemetry.update();
+        }
+
+        // Phase 2: gate open + intake on, shooter keeps running
+        gate.setPosition(GATE_CLOCKWISE_POSITION);
+        intakel.setPower(INTAKE_POWER);
+        intaker.setPower(INTAKE_POWER);
+        timer.reset();
+
+        while (opModeIsActive() && timer.seconds() < FEED_SECONDS) {
+            runShooter(pidL, pidR, SHOOTER_VELOCITY);
+
+            telemetry.addData("Phase", "feeding (gate open, intake on)");
+            telemetry.addData("Time left (s)", "%.1f", FEED_SECONDS - timer.seconds());
+            telemetry.addData("Shooter L/R vel", "%.0f / %.0f", shooterl.getVelocity(), shooterr.getVelocity());
+            telemetry.update();
+        }
+
+        // Stop everything and close the gate before driving again.
+        shooterl.setPower(0);
+        shooterr.setPower(0);
+        intakel.setPower(0);
+        intaker.setPower(0);
+        gate.setPosition(GATE_HOME_POSITION);
+    }
+
+    // One step of the shooter PID (call this every loop).
+    private void runShooter(BasicPIDController pidL, BasicPIDController pidR, double target) {
+
+        pidL.setPID(shooterP, shooterI, shooterD);
+        pidR.setPID(shooterP, shooterI, shooterD);
+
+        double powerL = pidL.update(target, shooterl.getVelocity())
+                + (target * shooterF);
+
+        double powerR = pidR.update(target, shooterr.getVelocity())
+                + (target * shooterF);
+
+        shooterl.setPower(powerL);
+        shooterr.setPower(powerR);
+    }
+
+    // Moves each wheel by its own tick delta (relative to wherever it currently is),
+    // using the hub's built-in RUN_TO_POSITION control, then stops and restores normal mode.
+    private void driveSegment(double lbTicks, double lfTicks, double rbTicks, double rfTicks,
+                               double power, String label) {
+
+        lb.setTargetPosition(lb.getCurrentPosition() + (int) Math.round(lbTicks));
+        lf.setTargetPosition(lf.getCurrentPosition() + (int) Math.round(lfTicks));
+        rb.setTargetPosition(rb.getCurrentPosition() + (int) Math.round(rbTicks));
+        rf.setTargetPosition(rf.getCurrentPosition() + (int) Math.round(rfTicks));
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        }
+
+        lb.setPower(Math.abs(power));
+        lf.setPower(Math.abs(power));
+        rb.setPower(Math.abs(power));
+        rf.setPower(Math.abs(power));
+
+        ElapsedTime timer = new ElapsedTime();
+        while (opModeIsActive()
+                && timer.seconds() < SEGMENT_TIMEOUT_S
+                && (lb.isBusy() || lf.isBusy() || rb.isBusy() || rf.isBusy())) {
+
+            telemetry.addData("Leg", label);
+            telemetry.addData("LB/LF/RB/RF pos", "%d / %d / %d / %d",
+                    lb.getCurrentPosition(), lf.getCurrentPosition(),
+                    rb.getCurrentPosition(), rf.getCurrentPosition());
+            telemetry.update();
+        }
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setPower(0);
+            m.setMode(DcMotor.RunMode.RUN_USING_ENCODER); // back to normal mode for the next segment
+        }
+    }
+
+    // Custom PID controller (same as KnightShiftTeleop)
+    public static class BasicPIDController {
+
+        private double Kp, Ki, Kd;
+        private double lastError = 0;
+        private double integral = 0;
+        private ElapsedTime timer = new ElapsedTime();
+
+        public BasicPIDController(double Kp, double Ki, double Kd) {
+            this.Kp = Kp;
+            this.Ki = Ki;
+            this.Kd = Kd;
+        }
+
+        public void setPID(double Kp, double Ki, double Kd) {
+            this.Kp = Kp;
+            this.Ki = Ki;
+            this.Kd = Kd;
+        }
+
+        public double update(double reference, double state) {
+
+            double error = reference - state;
+
+            double dt = timer.seconds();
+            timer.reset();
+
+            integral += error * dt;
+
+            double derivative =
+                    (dt != 0) ? (error - lastError) / dt : 0.0;
+
+            lastError = error;
+
+            return (Kp * error)
+                    + (Ki * integral)
+                    + (Kd * derivative);
+        }
+    }
+}
