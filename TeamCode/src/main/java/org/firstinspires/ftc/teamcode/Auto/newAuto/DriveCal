@@ -1,0 +1,157 @@
+package org.firstinspires.ftc.teamcode.Auto.newAuto;
+
+import com.acmerobotics.dashboard.config.Config;
+import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
+import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.HardwareMap;
+import com.qualcomm.robotcore.hardware.VoltageSensor;
+import com.qualcomm.robotcore.util.ElapsedTime;
+
+
+// One place for the numbers Showcase (recording), PathReplayAuto and DriveCalTest all share.
+// Editable live from FTC Dashboard, but Dashboard values are lost on restart: copy keepers here.
+//
+// THIS FILE ALSO NOW DRIVES THE ROBOT when selected on the Driver Station (forward, then
+// strafe right). That is a second job bolted onto a "shared constants" class — if other
+// autos (Showcase, PathReplayAuto, DriveCalTest) only read DriveCal.FIELD_NAME statically,
+// they are unaffected. But if you ever rename/delete this class because "it's just constants",
+// you will also delete this test routine. Consider splitting these into two files later.
+@Autonomous(name = "DriveCal")
+@Config
+public class DriveCal extends LinearOpMode {
+
+    public static double WHEEL_DIAMETER_MM = 76.0;
+
+    // UNVERIFIED. This is 28 encoder ticks per motor rev x 16 (the ratio you gave), which assumes
+    // 16:1 is the true total reduction. Measure it with DriveCalTest (turn one wheel exactly one
+    // revolution by hand, read the ticks) and overwrite this. It only sets the scale of
+    // inches and of the position-correction gain; the correction compares a replay to its own
+    // recording, so a wrong value does not by itself make the robot miss.
+    public static double TICKS_PER_WHEEL_REV = 448.0;
+
+    // Control Hub mounting: REV logo face up, USB ports toward the back of the robot.
+    public static RevHubOrientationOnRobot.LogoFacingDirection HUB_LOGO_DIRECTION =
+            RevHubOrientationOnRobot.LogoFacingDirection.UP;
+    public static RevHubOrientationOnRobot.UsbFacingDirection HUB_USB_DIRECTION =
+            RevHubOrientationOnRobot.UsbFacingDirection.BACKWARD;
+
+    // ---- What this OpMode actually does when you press play ----
+    public static double FORWARD_INCHES = 24.0;   // how far to drive forward first
+    public static double STRAFE_INCHES = 24.0;    // how far to strafe after that
+    public static double DRIVE_POWER = 0.4;       // keep this low for a first test
+    public static double SEGMENT_TIMEOUT_S = 5.0; // abort a leg if it hasn't finished by then (stalled motor, bad encoder, etc.)
+
+    // If the robot strafes LEFT when you wanted RIGHT, flip this to -1.0 and nothing else.
+    public static double STRAFE_SIGN = 1.0;
+
+    public static double ticksToInches(double ticks) {
+        return ticks / TICKS_PER_WHEEL_REV * Math.PI * WHEEL_DIAMETER_MM / 25.4;
+    }
+
+    public static double inchesToTicks(double inches) {
+        return inches / (Math.PI * WHEEL_DIAMETER_MM / 25.4) * TICKS_PER_WHEEL_REV;
+    }
+
+    // Robot-frame motion from the four wheel encoders (readings already follow each motor's
+    // direction setting). Same signs as Showcase's mixing: lb = f - s + t, lf = f + s + t,
+    // rb = f + s - t, rf = f - s - t. Forward and sideways only; turning cancels out of both.
+    public static double forwardTicks(double lb, double lf, double rb, double rf) {
+        return (lb + lf + rb + rf) / 4.0;
+    }
+
+    public static double strafeTicks(double lb, double lf, double rb, double rf) {
+        return (-lb + lf + rb - rf) / 4.0;
+    }
+
+    // Lowest voltage among the hub's sensors, or 12 V if none report.
+    public static double batteryVoltage(HardwareMap hw) {
+        double min = Double.POSITIVE_INFINITY;
+        for (VoltageSensor vs : hw.voltageSensor) {
+            double v = vs.getVoltage();
+            if (v > 0 && v < min) min = v;
+        }
+        return min == Double.POSITIVE_INFINITY ? 12.0 : min;
+    }
+
+    // ---- Hardware ----
+    private DcMotorEx lb, lf, rb, rf;
+
+    @Override
+    public void runOpMode() {
+
+        // Names must match the Robot Configuration exactly (same names Showcase uses).
+        lb = hardwareMap.get(DcMotorEx.class, "LB");
+        lf = hardwareMap.get(DcMotorEx.class, "LF");
+        rb = hardwareMap.get(DcMotorEx.class, "RB");
+        rf = hardwareMap.get(DcMotorEx.class, "RF");
+
+        // Same directions KnightShiftTeleop uses, so "forward" here means the same thing it does in TeleOp.
+        lb.setDirection(DcMotor.Direction.REVERSE);
+        lf.setDirection(DcMotor.Direction.FORWARD);
+        rb.setDirection(DcMotor.Direction.REVERSE);
+        rf.setDirection(DcMotor.Direction.FORWARD);
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+            m.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+            m.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        }
+
+        telemetry.addLine("DriveCal ready: forward " + FORWARD_INCHES + " in, then strafe " + STRAFE_INCHES + " in");
+        telemetry.update();
+
+        waitForStart();
+        if (isStopRequested()) return;
+
+        // Leg 1: straight forward. f only (s = 0, t = 0): every wheel gets the same ticks.
+        double fwdTicks = inchesToTicks(FORWARD_INCHES);
+        driveSegment(fwdTicks, fwdTicks, fwdTicks, fwdTicks, DRIVE_POWER, "forward");
+
+        // Leg 2: strafe right. s only (f = 0, t = 0): lb = -s, lf = +s, rb = +s, rf = -s.
+        double strTicks = inchesToTicks(STRAFE_INCHES) * STRAFE_SIGN;
+        driveSegment(-strTicks, strTicks, strTicks, -strTicks, DRIVE_POWER, "strafe right");
+
+        telemetry.addLine("Done.");
+        telemetry.update();
+    }
+
+    // Moves each wheel by its own tick delta (relative to wherever it currently is),
+    // using the hub's built-in RUN_TO_POSITION control, then stops and restores normal mode.
+    private void driveSegment(double lbTicks, double lfTicks, double rbTicks, double rfTicks,
+                               double power, String label) {
+
+        lb.setTargetPosition(lb.getCurrentPosition() + (int) Math.round(lbTicks));
+        lf.setTargetPosition(lf.getCurrentPosition() + (int) Math.round(lfTicks));
+        rb.setTargetPosition(rb.getCurrentPosition() + (int) Math.round(rbTicks));
+        rf.setTargetPosition(rf.getCurrentPosition() + (int) Math.round(rfTicks));
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        }
+
+        lb.setPower(Math.abs(power));
+        lf.setPower(Math.abs(power));
+        rb.setPower(Math.abs(power));
+        rf.setPower(Math.abs(power));
+
+        ElapsedTime timer = new ElapsedTime();
+        while (opModeIsActive()
+                && timer.seconds() < SEGMENT_TIMEOUT_S
+                && (lb.isBusy() || lf.isBusy() || rb.isBusy() || rf.isBusy())) {
+
+            telemetry.addData("Leg", label);
+            telemetry.addData("LB/LF/RB/RF pos", "%d / %d / %d / %d",
+                    lb.getCurrentPosition(), lf.getCurrentPosition(),
+                    rb.getCurrentPosition(), rf.getCurrentPosition());
+            telemetry.update();
+        }
+
+        for (DcMotorEx m : new DcMotorEx[]{lb, lf, rb, rf}) {
+            m.setPower(0);
+            m.setMode(DcMotor.RunMode.RUN_USING_ENCODER); // back to normal mode for the next segment
+        }
+    }
+}
